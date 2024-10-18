@@ -28,12 +28,14 @@
 import argparse
 import time
 from pathlib import Path
-
 import torch
 import tqdm
+import random
+
 import dllogger as DLLogger
 from dllogger import StdOutBackend, JSONStreamBackend, Verbosity
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import train_test_split
 
 from fastpitch.data_function import TTSCollate, TTSDataset
 
@@ -82,8 +84,18 @@ def parse_args(parser):
     parser.add_argument('--symbol_set', default='english_basic',
                         choices=['english_basic', 'english_mandarin_basic'],
                         help='Symbols in the dataset')
+    parser.add_argument('--num-seeds', type=int, default=10, help='Number of random seeds for repeated experiments')
     return parser
 
+
+def split_data(dataset, test_size=0.2, val_size=0.25, random_state=None):
+    indices = list(range(len(dataset)))
+    train_idx, test_idx = train_test_split(indices, test_size=test_size, random_state=random_state)
+    
+    # Train/Validation split (75% of the remaining 80% for training, 25% for validation)
+    train_idx, val_idx = train_test_split(train_idx, test_size=val_size, random_state=random_state)
+    
+    return train_idx, val_idx, test_idx
 
 def main():
     parser = argparse.ArgumentParser(description='FastPitch Data Pre-processing')
@@ -108,7 +120,6 @@ def main():
         Path(args.dataset_path, 'alignment_priors').mkdir(parents=False, exist_ok=True)
         
     for filelist in args.wav_text_filelists:
-
         print(f'Processing {filelist}...')
 
         dataset = TTSDataset(
@@ -133,6 +144,31 @@ def main():
             betabinomial_online_dir=None,
             pitch_online_dir=None,
             pitch_online_method=args.f0_method)
+            
+        for seed in range(args.num_seeds):  # 시드 루프를 파일 리스트 루프 바깥으로 이동
+            random.seed(seed)
+            torch.manual_seed(seed)
+    
+            # Data split
+            train_idx, val_idx, test_idx = split_data(dataset, test_size=0.2, val_size=0.25, random_state=seed)
+
+            # Subsets for train, val, test
+            train_set = Subset(dataset, train_idx)
+            val_set = Subset(dataset, val_idx)
+            test_set = Subset(dataset, test_idx)
+            
+            # Save or process train, val, test sets for this seed
+            seed_dir = Path(args.dataset_path).parent / f'seed_{seed}'
+            seed_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save index files
+            torch.save(train_idx, seed_dir / 'train_idx.pt')
+            torch.save(val_idx, seed_dir / 'val_idx.pt')
+            torch.save(test_idx, seed_dir / 'test_idx.pt')
+            
+            print(f'Seed {seed}: Train size={len(train_idx)}, Val size={len(val_idx)}, Test size={len(test_idx)}')
+
+
 
         data_loader = DataLoader(
             dataset,

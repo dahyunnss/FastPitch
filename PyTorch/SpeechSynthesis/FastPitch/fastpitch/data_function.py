@@ -232,6 +232,7 @@ class TTSDataset(torch.utils.data.Dataset):
         return len(self.audiopaths_and_text)
 
     def get_mel(self, filename):
+
         if not self.load_mel_from_disk:
             audio, sampling_rate = load_wav_to_torch(filename)
             if sampling_rate != self.stft.sampling_rate:
@@ -325,12 +326,29 @@ class TTSDataset(torch.utils.data.Dataset):
         return pitch_mel
 
 
+# def ensure_disjoint(*tts_datasets):
+#     paths = [set(list(zip(*d.audiopaths_and_text))[0]) for d in tts_datasets]
+#     assert sum(len(p) for p in paths) == len(set().union(*paths)), (
+#         "Your datasets (train, val) are not disjoint. "
+#         "Review filelists and restart training."
+#     )
+
 def ensure_disjoint(*tts_datasets):
-    paths = [set(list(zip(*d.audiopaths_and_text))[0]) for d in tts_datasets]
+    paths = []
+    for d in tts_datasets:
+        if isinstance(d, torch.utils.data.Subset):
+            # Subset 객체인 경우
+            audiopaths_and_text = [d.dataset.audiopaths_and_text[i] for i in d.indices] #error
+        else:
+            # 일반 데이터셋인 경우
+            audiopaths_and_text = d.audiopaths_and_text
+        dataset_paths = set(list(zip(*audiopaths_and_text))[0])
+        paths.append(dataset_paths)
     assert sum(len(p) for p in paths) == len(set().union(*paths)), (
         "Your datasets (train, val) are not disjoint. "
         "Review filelists and restart training."
     )
+
 
 
 class TTSCollate:

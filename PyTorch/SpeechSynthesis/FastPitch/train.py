@@ -1,30 +1,3 @@
-# *****************************************************************************
-#  Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-#  Redistribution and use in source and binary forms, with or without
-#  modification, are permitted provided that the following conditions are met:
-#      * Redistributions of source code must retain the above copyright
-#        notice, this list of conditions and the following disclaimer.
-#      * Redistributions in binary form must reproduce the above copyright
-#        notice, this list of conditions and the following disclaimer in the
-#        documentation and/or other materials provided with the distribution.
-#      * Neither the name of the NVIDIA CORPORATION nor the
-#        names of its contributors may be used to endorse or promote products
-#        derived from this software without specific prior written permission.
-#
-#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-#  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-#  DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
-#  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-#  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-#  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-#  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# *****************************************************************************
-
 import argparse
 import copy
 import os
@@ -35,10 +8,12 @@ from itertools import cycle
 import numpy as np
 import torch
 import torch.distributed as dist
-import amp_C
-from apex.optimizers import FusedAdam, FusedLAMB
+#import amp_C
+#from apex.optimizers import FusedAdam, FusedLAMB
+from torch.optim import Adam
+from torch.cuda.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 import common.tb_dllogger as logger
@@ -57,7 +32,7 @@ from fastpitch.loss_function import FastPitchLoss
 def parse_args(parser):
     parser.add_argument('-o', '--output', type=str, required=True,
                         help='Directory to save checkpoints')
-    parser.add_argument('-d', '--dataset-path', type=str, default='./',
+    parser.add_argument('-d', '--dataset-path', type=str, default='/userHome/userhome2/dahyun/DeepLearningExamples/PyTorch/SpeechSynthesis/FastPitch/LJSpeech-1.1',
                         help='Path to dataset')
     parser.add_argument('--log-file', type=str, default=None,
                         help='Path to a DLLogger log file')
@@ -68,14 +43,12 @@ def parse_args(parser):
     train.add_argument('--epochs-per-checkpoint', type=int, default=50,
                        help='Number of epochs per checkpoint')
     train.add_argument('--checkpoint-path', type=str, default=None,
-                       help='Checkpoint path to resume training')
+                       help='Checkpoint path to resume training') #학습을 재개할 체크포인트 경로
     train.add_argument('--keep-milestones', default=list(range(100, 1000, 100)),
                        type=int, nargs='+',
-                       help='Milestone checkpoints to keep from removing')
+                       help='Milestone checkpoints to keep from removing') #삭제하지 않고 유지할 체크포인트 마일스톤
     train.add_argument('--resume', action='store_true',
-                       help='Resume training from the last checkpoint')
-    train.add_argument('--seed', type=int, default=1234,
-                       help='Seed for PyTorch random number generators')
+                       help='Resume training from the last checkpoint') #마지막 체크포인트에서 학습 재개
     train.add_argument('--amp', action='store_true',
                        help='Enable AMP')
     train.add_argument('--cuda', action='store_true',
@@ -100,7 +73,7 @@ def parse_args(parser):
                        help='Initialize model weights with a pre-trained ckpt')
 
     opt = parser.add_argument_group('optimization setup')
-    opt.add_argument('--optimizer', type=str, default='lamb',
+    opt.add_argument('--optimizer', type=str, default='adam',
                      help='Optimization algorithm')
     opt.add_argument('-lr', '--learning-rate', type=float, required=True,
                      help='Learing rate')
@@ -180,8 +153,9 @@ def parse_args(parser):
                        help='Maximum mel frequency')
 
     dist = parser.add_argument_group('distributed setup')
-    dist.add_argument('--local_rank', type=int, default=os.getenv('LOCAL_RANK', 0),
-                      help='Rank of the process for multiproc; do not set manually')
+    # dist.add_argument('--local_rank', type=int, default=os.getenv('LOCAL_RANK', 0),
+    #                   help='Rank of the process for multiproc; do not set manually')
+
     dist.add_argument('--world_size', type=int, default=os.getenv('WORLD_SIZE', 1),
                       help='Number of processes for multiproc; do not set manually')
     return parser
@@ -259,79 +233,113 @@ def adjust_learning_rate(total_iter, opt, learning_rate, warmup_iters=None):
         param_group['lr'] = learning_rate * scale
 
 
-def apply_ema_decay(model, ema_model, decay):
-    if not decay:
-        return
-    st = model.state_dict()
-    add_module = hasattr(model, 'module') and not hasattr(ema_model, 'module')
-    for k, v in ema_model.state_dict().items():
-        if add_module and not k.startswith('module.'):
-            k = 'module.' + k
-        v.copy_(decay * v + (1 - decay) * st[k])
+# def apply_ema_decay(model, ema_model, decay):
+#     if not decay:
+#         return
+#     st = model.state_dict()
+#     add_module = hasattr(model, 'module') and not hasattr(ema_model, 'module')
+#     for k, v in ema_model.state_dict().items():
+#         if add_module and not k.startswith('module.'):
+#             k = 'module.' + k
+#         v.copy_(decay * v + (1 - decay) * st[k])
 
 
-def init_multi_tensor_ema(model, ema_model):
-    model_weights = list(model.state_dict().values())
-    ema_model_weights = list(ema_model.state_dict().values())
-    ema_overflow_buf = torch.cuda.IntTensor([0])
-    return model_weights, ema_model_weights, ema_overflow_buf
+# def init_multi_tensor_ema(model, ema_model):
+#     model_weights = list(model.state_dict().values())
+#     ema_model_weights = list(ema_model.state_dict().values())
+#     ema_overflow_buf = torch.cuda.IntTensor([0])
+#     return model_weights, ema_model_weights, ema_overflow_buf
 
 
-def apply_multi_tensor_ema(decay, model_weights, ema_weights, overflow_buf):
-    amp_C.multi_tensor_axpby(
-        65536, overflow_buf, [ema_weights, model_weights, ema_weights],
-        decay, 1-decay, -1)
+def apply_ema(model, ema_model, decay): #수정
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
 
+
+
+def load_seed_datasets(seed, args):
+    """
+    Load train, validation, and test datasets based on seed.
+    """
+    seed_dir = os.path.join(args.dataset_path, f"seed_{seed}")
+    
+    train_idx = torch.load(os.path.join(seed_dir, 'train_idx.pt'))
+    val_idx = torch.load(os.path.join(seed_dir, 'val_idx.pt'))
+    test_idx = torch.load(os.path.join(seed_dir, 'test_idx.pt'))
+
+    # TTSDataset 인스턴스 생성
+    trainset = TTSDataset(audiopaths_and_text=args.training_files, **vars(args))
+    valset = TTSDataset(audiopaths_and_text=args.validation_files, **vars(args))
+
+    # Subset으로 나눈 train, val, test 데이터셋 생성
+    train_set = Subset(trainset, train_idx)
+    val_set = Subset(valset, val_idx)
+    test_set = Subset(valset, test_idx)  
+    return train_set, val_set, test_set
 
 def main():
     parser = argparse.ArgumentParser(description='PyTorch FastPitch Training',
                                      allow_abbrev=False)
+    parser.add_argument('--seed', type=int, required=True,
+                        help='PyTorch random seed')
     parser = parse_args(parser)
     args, _ = parser.parse_known_args()
-
+    
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    
     if args.p_arpabet > 0.0:
         cmudict.initialize(args.cmudict_path, args.heteronyms_path)
 
     distributed_run = args.world_size > 1
+    
+    if distributed_run:
+        init_distributed(args, args.world_size, local_rank)
+    else:
+        if args.trainloader_repeats > 1:
+            print('경고: --trainloader-repeats가 비활성화되었습니다. 멀티-GPU 데이터 로딩에서만 지원됩니다.')
+            args.trainloader_repeats = 1
+    device = torch.device('cuda' if args.cuda else 'cpu')
+    
+    # 모델 인자 파싱
+    parser = models.parse_model_args('FastPitch', parser)
+    args, unk_args = parser.parse_known_args()
+    if len(unk_args) > 0:
+        raise ValueError(f'유효하지 않은 옵션 {unk_args}')
 
-    torch.manual_seed(args.seed + args.local_rank)
-    np.random.seed(args.seed + args.local_rank)
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    
+    print(f"seed: {args.seed}")
+    
+    # 랜덤 시드 설정
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
-    if args.local_rank == 0:
+    # 해당 시드에 대한 출력 디렉토리 조정
+    seed_output_dir = os.path.join(args.output, f'seed_{args.seed}')
+    args.output = seed_output_dir
+        
+    # 해당 시드에 대한 출력 디렉토리 생성
+    if local_rank == 0:
         if not os.path.exists(args.output):
             os.makedirs(args.output)
 
+    # 로거 초기화
     log_fpath = args.log_file or os.path.join(args.output, 'nvlog.json')
     tb_subsets = ['train', 'val']
     if args.ema_decay > 0.0:
         tb_subsets.append('val_ema')
-
-    logger.init(log_fpath, args.output, enabled=(args.local_rank == 0),
+        
+    logger.init(log_fpath, args.output, enabled=(local_rank == 0), 
                 tb_subsets=tb_subsets)
     logger.parameters(vars(args), tb_subset='train')
-
-    parser = models.parse_model_args('FastPitch', parser)
-    args, unk_args = parser.parse_known_args()
-    if len(unk_args) > 0:
-        raise ValueError(f'Invalid options {unk_args}')
-
-    torch.backends.cudnn.benchmark = args.cudnn_benchmark
-
-    if distributed_run:
-        init_distributed(args, args.world_size, args.local_rank)
-    else:
-        if args.trainloader_repeats > 1:
-            print('WARNING: Disabled --trainloader-repeats, supported only for'
-                  ' multi-GPU data loading.')
-            args.trainloader_repeats = 1
-
-    device = torch.device('cuda' if args.cuda else 'cpu')
+        
+    # 모델 초기화
     model_config = models.get_model_config('FastPitch', args)
     model = models.get_model('FastPitch', model_config, device)
-
+    
     if args.init_from_checkpoint is not None:
         load_pretrained_weights(model, args.init_from_checkpoint)
-
+        
     attention_kl_loss = AttentionBinarizationLoss()
 
     # Store pitch mean/std as params to translate from Hz during inference
@@ -339,16 +347,22 @@ def main():
     model.pitch_std[0] = args.pitch_std
 
     kw = dict(lr=args.learning_rate, betas=(0.9, 0.98), eps=1e-9,
-              weight_decay=args.weight_decay)
+            weight_decay=args.weight_decay)
     if args.optimizer == 'adam':
-        optimizer = FusedAdam(model.parameters(), **kw)
+        optimizer = Adam(model.parameters(), **kw)
     elif args.optimizer == 'lamb':
-        optimizer = FusedLAMB(model.parameters(), **kw)
+        try:
+            from torch_optimizer import Lamb
+            optimizer = Lamb(model.parameters(), **kw)
+        except ImportError:
+            raise ImportError("LAMB optimizer not found. Please install 'torch_optimizer' package or use 'adam' optimizer.")
+
     else:
-        raise ValueError
+        raise ValueError("Unsupported optimizer. Please use 'adam' or 'lamb'.")
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = GradScaler(enabled=args.amp)
 
+    # EMA 모델
     if args.ema_decay > 0:
         ema_model = copy.deepcopy(model)
     else:
@@ -356,8 +370,9 @@ def main():
 
     if distributed_run:
         model = DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank,
+            model, device_ids=[local_rank], output_device=local_rank,
             find_unused_parameters=True)
+        
 
     train_state = {'epoch': 1, 'total_iter': 1}
     checkpointer = Checkpointer(args.output, args.keep_milestones)
@@ -375,32 +390,33 @@ def main():
 
     collate_fn = TTSCollate()
 
-    if args.local_rank == 0:
+    if local_rank == 0:
         prepare_tmp(args.pitch_online_dir)
-
-    trainset = TTSDataset(audiopaths_and_text=args.training_files, **vars(args))
-    valset = TTSDataset(audiopaths_and_text=args.validation_files, **vars(args))
-    ensure_disjoint(trainset, valset)
+        
+    # 해당 시드에 대한 데이터셋 로드
+    train_set, val_set, test_set = load_seed_datasets(args.seed, args)
+    # trainset = TTSDataset(audiopaths_and_text=args.training_files, **vars(args))
+    # valset = TTSDataset(audiopaths_and_text=args.validation_files, **vars(args))
+    ensure_disjoint(train_set, val_set)
 
     if distributed_run:
         train_sampler = RepeatedDistributedSampler(args.trainloader_repeats,
-                                                   trainset, drop_last=True)
-        val_sampler = DistributedSampler(valset)
+                                                train_set, drop_last=True)
+        val_sampler = DistributedSampler(val_set)
         shuffle = False
     else:
         train_sampler, val_sampler, shuffle = None, None, True
 
     # 4 workers are optimal on DGX-1 (from epoch 2 onwards)
+    # dataloader 생성
     kw = {'num_workers': args.num_workers, 'batch_size': args.batch_size,
-          'collate_fn': collate_fn}
-    train_loader = RepeatedDataLoader(args.trainloader_repeats, trainset,
-                                      shuffle=shuffle, drop_last=True,
-                                      sampler=train_sampler, pin_memory=True,
-                                      persistent_workers=True, **kw)
-    val_loader = DataLoader(valset, shuffle=False, sampler=val_sampler,
+        'collate_fn': collate_fn}
+    train_loader = RepeatedDataLoader(args.trainloader_repeats, train_set,
+                                    shuffle=shuffle, drop_last=True,
+                                    sampler=train_sampler, pin_memory=True,
+                                    persistent_workers=True, **kw)
+    val_loader = DataLoader(val_set, shuffle=False, sampler=val_sampler,
                             pin_memory=False, **kw)
-    if args.ema_decay:
-        mt_ema_params = init_multi_tensor_ema(model, ema_model)
 
     model.train()
     bmark_stats = BenchmarkStats()
@@ -424,16 +440,17 @@ def main():
 
         epoch_iter = 1
         for batch, accum_step in zip(train_loader,
-                                     cycle(range(1, args.grad_accumulation + 1))):
+                                    cycle(range(1, args.grad_accumulation + 1))):
             if accum_step == 1:
                 adjust_learning_rate(total_iter, optimizer, args.learning_rate,
-                                     args.warmup_steps)
+                                    args.warmup_steps)
 
                 model.zero_grad(set_to_none=True)
 
             x, y, num_frames = batch_to_gpu(batch)
 
-            with torch.cuda.amp.autocast(enabled=args.amp):
+        
+            with autocast(enabled=args.amp):
                 y_pred = model(x)
                 loss, meta = criterion(y_pred, y)
 
@@ -493,7 +510,7 @@ def main():
                     optimizer.step()
 
                 if args.ema_decay > 0.0:
-                    apply_multi_tensor_ema(args.ema_decay, *mt_ema_params)
+                    apply_ema(model, ema_model, args.ema_decay)
 
                 iter_mel_loss = iter_meta['mel_loss'].item()
                 iter_kl_loss = iter_meta['kl_loss'].item()
@@ -538,15 +555,15 @@ def main():
                 ('took', epoch_time)]),
         )
         bmark_stats.update(epoch_num_frames, epoch_loss, epoch_mel_loss,
-                           epoch_time)
+                        epoch_time)
 
         if epoch % args.validation_freq == 0:
             validate(model, epoch, total_iter, criterion, val_loader,
-                 distributed_run, batch_to_gpu)
+                distributed_run, batch_to_gpu)
 
             if args.ema_decay > 0:
                 validate(ema_model, epoch, total_iter, criterion, val_loader,
-                         distributed_run, batch_to_gpu, ema=True)
+                        distributed_run, batch_to_gpu, ema=True)
 
         # save before making sched.step() for proper loading of LR
         checkpointer.maybe_save(args, model, ema_model, optimizer, scaler,
@@ -559,8 +576,8 @@ def main():
             data=bmark_stats.get(args.benchmark_epochs_num))
 
     validate(model, None, total_iter, criterion, val_loader, distributed_run,
-             batch_to_gpu)
-
+            batch_to_gpu)
+    print(f"seed {args.seed} finished")
 
 if __name__ == '__main__':
     main()
